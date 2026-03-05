@@ -1,0 +1,1398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <!--
+    ============================================================
+    RC PILOT — Futuristic RC Car Controller Dashboard
+    ============================================================
+    PROTOCOL STRING (13-character TX string):
+      Index  Description             Range
+      [0]    Movement sign           '+' or '-'
+      [1-3]  Movement magnitude      000–255
+      [4]    Steering sign           '+' or '-'
+      [5-7]  Steering magnitude      000–255
+      [8]    Brake/Stop              0=move, 1=brake
+      [9]    Beam (manual headlight) 0=off, 1=on
+      [10]   Auto Headlight          0=off, 1=on
+      [11]   Wander (autonomous)     0=off, 1=on
+      [12]   Avoid Obstacle          0=off, 1=on
+
+    ESP32 PARSING (matches your code exactly):
+      drive.FBSpeed  = cmd.substring(0,4).toInt()   // [0]+/-sign [1-3] 0-255
+      drive.steer    = cmd.substring(4,8).toInt()   // [4]+/-sign [5-7] 0-255
+      drive.toStop   = cmd.substring(8,9).toInt()   // [8] 0=move 1=brake
+      beam           = cmd.substring(9,10).toInt()  // [9]
+      autoHeadlight  = cmd.substring(10,11).toInt() // [10]
+      wander         = cmd.substring(11,12).toInt() // [11]
+      avoidObstacle  = cmd.substring(12).toInt()    // [12]
+
+    NOTES:
+      - beam & autoHeadlight are MUTUALLY EXCLUSIVE
+      - wander auto-disables on ANY user interaction
+      - GYRO MODE: beta axis (front/back tilt) => movement speed/direction
+        gamma (left/right) is display-only readout
+    ============================================================
+  -->
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>RC PILOT</title>
+  <style>
+    *, *::before, *::after {
+      margin: 0; padding: 0;
+      box-sizing: border-box;
+      -webkit-tap-highlight-color: transparent;
+    }
+    :root {
+      --accent: #00d4ff;
+      --accent-glow: rgba(0,212,255,0.5);
+      --accent-dim: rgba(0,212,255,0.12);
+      --danger: #ff3b5c;
+      --success: #00ff88;
+      --warning: #ffaa00;
+      --beam-color: #ffe066;
+      --auto-color: #bb86fc;
+      --avoid-color: #ff6b35;
+      --glass-bg: rgba(255,255,255,0.04);
+      --glass-border: rgba(255,255,255,0.08);
+      --text-primary: #eaeaea;
+      --text-secondary: rgba(255,255,255,0.5);
+      --text-dim: rgba(255,255,255,0.25);
+      --bg-deep: #050510;
+    }
+    html, body {
+      width: 100%; height: 100%;
+      overflow: hidden;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: var(--bg-deep);
+      color: var(--text-primary);
+      touch-action: none;
+    }
+    body::before {
+      content: '';
+      position: fixed; inset: 0;
+      background-image:
+        linear-gradient(rgba(0,212,255,0.025) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(0,212,255,0.025) 1px, transparent 1px);
+      background-size: 50px 50px;
+      pointer-events: none; z-index: 0;
+    }
+    body::after {
+      content: '';
+      position: fixed;
+      top: 30%; left: 50%;
+      width: 60vw; height: 60vw;
+      background: radial-gradient(circle, rgba(0,212,255,0.05) 0%, transparent 70%);
+      transform: translate(-50%, -50%);
+      pointer-events: none; z-index: 0;
+    }
+
+    /* ==============================
+       PORTRAIT OVERLAY
+       ============================== */
+    .rotate-overlay {
+      display: none;
+      position: fixed; inset: 0; z-index: 9999;
+      background: var(--bg-deep);
+      flex-direction: column;
+      align-items: center; justify-content: center; gap: 24px;
+    }
+    .rotate-icon {
+      width: 80px; height: 80px;
+      animation: rotateHint 2s ease-in-out infinite;
+    }
+    .rotate-text {
+      font-size: 18px; font-weight: 800; letter-spacing: 3px;
+      text-transform: uppercase; color: var(--accent);
+      text-shadow: 0 0 12px var(--accent-glow);
+    }
+    .rotate-sub { font-size: 13px; color: var(--text-secondary); }
+    @keyframes rotateHint {
+      0%,100% { transform: rotate(0deg); }
+      50%      { transform: rotate(90deg); }
+    }
+    /* Show on mobile portrait only */
+    @media (max-width: 1023px) and (orientation: portrait) {
+      .rotate-overlay { display: flex; }
+      #app { display: none !important; }
+    }
+
+    /* ==============================
+       GLASS
+       ============================== */
+    .glass {
+      background: var(--glass-bg);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      border: 1px solid var(--glass-border);
+      border-radius: 16px;
+    }
+
+    /* ==============================
+       APP — fills full viewport perfectly
+       ============================== */
+    #app {
+      position: relative; z-index: 1;
+      display: grid;
+      grid-template-rows: auto auto 1fr auto auto;
+      width: 100vw;
+      height: 100vh;
+      height: 100dvh;
+      padding: 5px;
+      gap: 4px;
+    }
+
+    /* ==============================
+       HEADER
+       ============================== */
+    .header {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr;
+      align-items: center;
+      padding: 5px 14px;
+    }
+    .logo {
+      grid-column: 2;
+      font-size: clamp(13px, 2vw, 20px);
+      font-weight: 800; letter-spacing: 4px;
+      color: var(--accent);
+      text-shadow: 0 0 14px var(--accent-glow);
+      white-space: nowrap;
+    }
+    .conn-status {
+      grid-column: 3;
+      display: flex; align-items: center; justify-content: flex-end;
+      gap: clamp(4px,0.8vw,10px);
+    }
+    .wifi-bars {
+      display: flex; align-items: flex-end;
+      gap: 2px; height: clamp(12px,1.6vw,18px);
+    }
+    .wifi-bar {
+      width: clamp(3px,0.45vw,5px);
+      border-radius: 1px;
+      background: var(--text-dim);
+      transition: background .4s, box-shadow .4s;
+    }
+    .wifi-bar:nth-child(1) { height: 30%; }
+    .wifi-bar:nth-child(2) { height: 55%; }
+    .wifi-bar:nth-child(3) { height: 78%; }
+    .wifi-bar:nth-child(4) { height: 100%; }
+    .wifi-bars.sig-1 .wifi-bar:nth-child(1)    { background: var(--danger); box-shadow: 0 0 4px var(--danger); }
+    .wifi-bars.sig-2 .wifi-bar:nth-child(-n+2)  { background: var(--warning); box-shadow: 0 0 4px var(--warning); }
+    .wifi-bars.sig-3 .wifi-bar:nth-child(-n+3)  { background: #aaff00; box-shadow: 0 0 4px #aaff00; }
+    .wifi-bars.sig-4 .wifi-bar                  { background: var(--success); box-shadow: 0 0 5px var(--success); }
+    .conn-text-group {
+      display: flex; flex-direction: column; align-items: flex-end; gap: 1px;
+    }
+    .conn-label-txt {
+      font-size: clamp(8px,1vw,11px); font-weight: 700;
+      letter-spacing: 1px; text-transform: uppercase;
+      color: var(--danger); transition: color .4s;
+    }
+    .conn-label-txt.connected { color: var(--success); }
+    .conn-speed-txt {
+      font-size: clamp(7px,0.85vw,9px); letter-spacing: 1px;
+      color: var(--text-dim); font-variant-numeric: tabular-nums;
+    }
+
+    /* ==============================
+       MODE TABS
+       ============================== */
+    .mode-tabs { display: flex; gap: 4px; }
+    .mode-tab {
+      flex: 1;
+      display: flex; flex-direction: column; align-items: center; gap: 1px;
+      padding: clamp(4px,0.9vh,9px) 0;
+      background: transparent;
+      border: 1px solid var(--glass-border);
+      border-radius: 12px;
+      color: var(--text-secondary);
+      font-size: clamp(7px,1vw,11px);
+      font-weight: 700; letter-spacing: 1px;
+      text-transform: uppercase;
+      cursor: pointer; transition: all .3s;
+    }
+    .mode-tab .tab-icon { line-height: 1; }
+    .mode-tab .tab-icon svg { width: clamp(13px,1.9vw,20px); height: clamp(13px,1.9vw,20px); }
+    .mode-tab.active {
+      background: var(--accent-dim);
+      border-color: var(--accent); color: var(--accent);
+      box-shadow: 0 0 14px rgba(0,212,255,0.15), inset 0 0 14px rgba(0,212,255,0.05);
+    }
+
+    /* ==============================
+       CONTROL AREA
+       ============================== */
+    .control-area { position: relative; overflow: hidden; min-height: 0; }
+    .mode-panel {
+      position: absolute; inset: 0;
+      display: flex; align-items: center; justify-content: center;
+      opacity: 0; pointer-events: none; transition: opacity .3s;
+    }
+    .mode-panel.active { opacity: 1; pointer-events: auto; }
+
+    /* ==============================
+       SPEEDOMETER
+       ============================== */
+    .speedometer {
+      display: flex; flex-direction: column; align-items: center; gap: 2px;
+    }
+    .speedo-ring {
+      width: clamp(54px,7.5vw,88px); height: clamp(54px,7.5vw,88px);
+      border-radius: 50%;
+      border: 2px solid var(--glass-border);
+      background: radial-gradient(circle, rgba(0,212,255,0.07) 0%, transparent 70%);
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+    }
+    .speedo-value {
+      font-size: clamp(16px,2.8vw,28px); font-weight: 800;
+      font-variant-numeric: tabular-nums; line-height: 1;
+    }
+    .speedo-unit {
+      font-size: clamp(6px,0.85vw,9px); font-weight: 600;
+      color: var(--text-secondary); letter-spacing: 1px; text-transform: uppercase;
+    }
+    .speedo-label {
+      font-size: clamp(6px,0.85vw,9px); color: var(--text-dim);
+      letter-spacing: 1px; text-transform: uppercase;
+    }
+
+    /* ==============================
+       SHARED BUTTON BASES
+       ============================== */
+    .ctrl-btn {
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 3px;
+      background: var(--glass-bg); border: 1px solid var(--glass-border);
+      border-radius: 16px; color: var(--text-secondary);
+      cursor: pointer; transition: all .12s ease;
+      user-select: none; -webkit-user-select: none;
+    }
+    .ctrl-btn svg { fill: currentColor; }
+    .ctrl-btn.pressed, .ctrl-btn:active {
+      background: var(--accent-dim); border-color: var(--accent); color: var(--accent);
+      box-shadow: 0 0 20px rgba(0,212,255,0.3); transform: scale(0.95);
+    }
+    .fwd-style { color: var(--success); }
+    .fwd-style.pressed, .fwd-style:active {
+      background: rgba(0,255,136,0.12); border-color: var(--success); color: var(--success);
+      box-shadow: 0 0 25px rgba(0,255,136,0.25); transform: scale(0.95);
+    }
+    .brake-btn {
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 3px;
+      border-radius: 50%;
+      background: rgba(255,59,92,0.05); border: 2px solid rgba(255,59,92,0.3);
+      color: var(--danger); cursor: pointer; transition: all .12s ease;
+      user-select: none; -webkit-user-select: none;
+    }
+    .brake-btn svg { fill: currentColor; }
+    .brake-btn.pressed, .brake-btn:active {
+      background: rgba(255,59,92,0.2); border-color: var(--danger);
+      box-shadow: 0 0 30px rgba(255,59,92,0.4); transform: scale(0.95);
+    }
+    .btn-lbl {
+      font-size: clamp(6px,0.85vw,9px); font-weight: 700;
+      letter-spacing: 1px; text-transform: uppercase;
+    }
+
+    /* ==============================
+       D-PAD (Mode 1)
+       ============================== */
+    .dpad-wrapper {
+      display: flex; align-items: center; justify-content: center;
+      gap: clamp(10px,2vw,28px); width: 100%; height: 100%;
+      padding: 0 clamp(4px,1vw,14px);
+    }
+    .dpad-col { display: flex; flex-direction: column; gap: clamp(7px,1.5vh,16px); }
+    .dpad-center { display: flex; flex-direction: column; align-items: center; gap: clamp(8px,1.7vh,18px); }
+    /* D-Pad buttons: larger with chamfered angular corners */
+    .dpad-btn {
+      width: clamp(90px,13vw,145px); height: clamp(72px,10.5vh,112px);
+      border-radius: 8px !important;
+      clip-path: polygon(10px 0%,calc(100% - 10px) 0%,100% 10px,100% calc(100% - 10px),calc(100% - 10px) 100%,10px 100%,0% calc(100% - 10px),0% 10px);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.07), inset 0 -1px 0 rgba(0,0,0,0.25), 2px 2px 8px rgba(0,0,0,0.4);
+    }
+    .dpad-btn svg { width: clamp(28px,3.8vw,44px); height: clamp(28px,3.8vw,44px); }
+    .dpad-brake {
+      width: clamp(60px,8.5vw,92px); height: clamp(60px,8.5vw,92px);
+    }
+    .dpad-brake svg { width: clamp(22px,3vw,32px); height: clamp(22px,3vw,32px); }
+
+    /* ==============================
+       STEERING WHEEL (Mode 2)
+       ============================== */
+    .steering-layout {
+      display: flex; align-items: center; justify-content: space-between;
+      width: 100%; height: 100%; padding: 0 clamp(4px,1.5vw,16px);
+      position: relative;
+    }
+    .steer-left {
+      display: flex; flex-direction: column; align-items: center;
+      gap: clamp(5px,1vh,12px); flex-shrink: 0; z-index: 2;
+    }
+    .steer-fwd, .steer-bwd {
+      width: clamp(58px,8.5vw,80px); height: clamp(52px,7.5vh,70px);
+    }
+    .steer-fwd svg, .steer-bwd svg { width: clamp(20px,2.6vw,28px); height: clamp(20px,2.6vw,28px); }
+    .steer-brake {
+      width: clamp(52px,7.5vw,70px); height: clamp(52px,7.5vw,70px);
+    }
+    .steer-brake svg { width: clamp(18px,2.4vw,26px); height: clamp(18px,2.4vw,26px); }
+
+    .steer-speedo-wrap {
+      position: absolute; bottom: clamp(6px,1.5vh,14px); left: 50%;
+      transform: translateX(-50%); z-index: 3;
+    }
+    .wheel-wrapper {
+      display: flex; flex-direction: column; align-items: center; gap: 5px;
+      flex-shrink: 0; z-index: 2;
+    }
+    .wheel-angle-display {
+      font-size: clamp(10px,1.4vw,15px); font-weight: 700; color: var(--accent);
+      font-variant-numeric: tabular-nums; text-shadow: 0 0 8px var(--accent-glow);
+    }
+    /* Steering wheel image */
+    .sw-img {
+      width: clamp(160px,24vw,280px); height: clamp(160px,24vw,280px);
+      cursor: grab; touch-action: none;
+      border-radius: 50%;
+      user-select: none; -webkit-user-select: none;
+      display: block; transition: filter .2s;
+    }
+    .sw-img:active { cursor: grabbing; }
+    .sw-img.dragging { filter: drop-shadow(0 0 16px rgba(0,212,255,0.55)); }
+
+    /* ==============================
+       GYRO (Mode 3)
+       ============================== */
+    .gyro-layout {
+      display: flex; align-items: center; justify-content: space-between;
+      width: 100%; height: 100%; padding: 0 clamp(8px,2vw,20px);
+    }
+    .gyro-left { display: flex; flex-direction: column; align-items: center; gap: clamp(7px,1.4vh,16px); flex-shrink: 0; }
+    .gyro-center { display: flex; flex-direction: column; align-items: center; gap: clamp(7px,1.2vh,14px); }
+    .gyro-right { flex-shrink: 0; }
+    .gyro-btn {
+      width: clamp(68px,9.5vw,96px); height: clamp(68px,9.5vw,96px); border-radius: 20px;
+    }
+    .gyro-btn svg { width: clamp(24px,3vw,34px); height: clamp(24px,3vw,34px); }
+    .gyro-brake {
+      width: clamp(58px,8vw,78px); height: clamp(58px,8vw,78px);
+    }
+    .gyro-brake svg { width: clamp(20px,2.6vw,28px); height: clamp(20px,2.6vw,28px); }
+
+    .btn-enable-gyro {
+      padding: clamp(6px,0.9vh,12px) clamp(12px,1.8vw,22px);
+      border-radius: 14px; border: 1px solid var(--accent);
+      background: var(--accent-dim); color: var(--accent);
+      font-size: clamp(8px,1vw,12px); font-weight: 700; letter-spacing: 1px;
+      cursor: pointer; transition: all .2s; user-select: none;
+    }
+    .btn-enable-gyro:hover { box-shadow: 0 0 20px rgba(0,212,255,0.3); }
+    .btn-enable-gyro.enabled {
+      background: rgba(0,255,136,0.1); border-color: var(--success); color: var(--success);
+    }
+    .gyro-readout {
+      display: flex; gap: 14px;
+      font-size: clamp(9px,1.1vw,13px); color: var(--text-secondary);
+    }
+    .gyro-readout .rl { font-size: clamp(7px,0.85vw,9px); color: var(--text-dim); letter-spacing: 1px; text-transform: uppercase; }
+    .gyro-sens {
+      display: flex; flex-direction: column; align-items: center; gap: 4px;
+      width: clamp(100px,13vw,160px);
+    }
+    .gyro-sens .sl { font-size: clamp(7px,0.85vw,9px); font-weight: 600; color: var(--text-dim); letter-spacing: 1px; text-transform: uppercase; }
+    .gyro-sens .sv { font-size: clamp(9px,1.1vw,13px); font-weight: 700; color: var(--accent); font-variant-numeric: tabular-nums; }
+    .gyro-sens input[type=range] {
+      -webkit-appearance: none; appearance: none;
+      width: 100%; height: 6px; border-radius: 3px; outline: none; cursor: pointer;
+      background: linear-gradient(to right, var(--glass-border), var(--accent-dim));
+    }
+    .gyro-sens input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 20px; height: 20px; border-radius: 50%;
+      background: var(--accent); box-shadow: 0 0 10px var(--accent-glow);
+      border: 2px solid rgba(255,255,255,0.2); cursor: pointer;
+    }
+    .gyro-sens input[type=range]::-moz-range-thumb {
+      width: 20px; height: 20px; border-radius: 50%;
+      background: var(--accent); box-shadow: 0 0 10px var(--accent-glow);
+      border: 2px solid rgba(255,255,255,0.2); cursor: pointer;
+    }
+
+    /* ==============================
+       BOTTOM TOGGLES
+       ============================== */
+    .bottom-bar { display: flex; gap: 4px; }
+    .toggle-btn {
+      flex: 1;
+      display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
+      padding: clamp(5px,0.9vh,11px) 0;
+      background: var(--glass-bg); border: 1px solid var(--glass-border);
+      border-radius: 14px; color: var(--text-dim);
+      cursor: pointer; transition: all .25s; user-select: none;
+    }
+    .toggle-btn svg { width: clamp(14px,1.9vw,21px); height: clamp(14px,1.9vw,21px); fill: currentColor; transition: filter .25s; }
+    .toggle-btn span { font-size: clamp(6px,0.85vw,9px); font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; }
+
+    .toggle-btn.beam-on  { color: var(--beam-color); background: rgba(255,224,102,0.1); border-color: var(--beam-color); box-shadow: 0 0 14px rgba(255,224,102,0.2); }
+    .toggle-btn.beam-on svg { filter: drop-shadow(0 0 6px rgba(255,224,102,0.6)); }
+    .toggle-btn.auto-on  { color: var(--auto-color); background: rgba(187,134,252,0.1); border-color: var(--auto-color); box-shadow: 0 0 14px rgba(187,134,252,0.2); }
+    .toggle-btn.auto-on svg { filter: drop-shadow(0 0 6px rgba(187,134,252,0.5)); }
+    .toggle-btn.avoid-on { color: var(--avoid-color); background: rgba(255,107,53,0.1); border-color: var(--avoid-color); box-shadow: 0 0 14px rgba(255,107,53,0.2); }
+    .toggle-btn.avoid-on svg { filter: drop-shadow(0 0 6px rgba(255,107,53,0.5)); }
+    @keyframes wanderPulse {
+      0%,100% { box-shadow: 0 0 10px rgba(255,170,0,0.1); }
+      50%      { box-shadow: 0 0 26px rgba(255,170,0,0.35); }
+    }
+    .toggle-btn.wander-on { color: var(--warning); background: rgba(255,170,0,0.1); border-color: var(--warning); animation: wanderPulse 2s ease-in-out infinite; }
+    .toggle-btn.wander-on svg { filter: drop-shadow(0 0 6px rgba(255,170,0,0.5)); }
+
+    /* ==============================
+       DEBUG BAR
+       ============================== */
+    .debug-bar {
+      display: flex; align-items: center; justify-content: center; gap: 8px;
+      padding: clamp(3px,0.7vh,7px) 14px;
+    }
+    .debug-bar .lbl { color: var(--text-dim); font-weight: 600; letter-spacing: 1px; font-size: clamp(9px,1vw,11px); }
+    .debug-bar code {
+      font-family: 'Courier New', monospace;
+      font-size: clamp(11px,1.4vw,15px); font-weight: 700; letter-spacing: 2px;
+      color: var(--accent); text-shadow: 0 0 6px var(--accent-glow);
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Portrait overlay -->
+  <div class="rotate-overlay">
+    <svg class="rotate-icon" viewBox="0 0 100 100" fill="none">
+      <rect x="20" y="10" width="60" height="80" rx="8" stroke="var(--accent)" stroke-width="3" fill="none"/>
+      <circle cx="50" cy="80" r="4" fill="var(--accent)" opacity="0.5"/>
+      <path d="M65 50L80 50L80 35" stroke="var(--text-secondary)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+      <path d="M80 50C80 30,60 20,50 20" stroke="var(--text-secondary)" stroke-width="2.5" stroke-linecap="round" fill="none"/>
+    </svg>
+    <span class="rotate-text">Rotate Your Device</span>
+    <span class="rotate-sub">Controller requires landscape mode</span>
+  </div>
+
+  <div id="app">
+
+    <!-- HEADER -->
+    <header class="header glass">
+      <div></div>
+      <div class="logo">RC PILOT</div>
+      <div class="conn-status">
+        <div class="wifi-bars" id="wifiBars">
+          <div class="wifi-bar"></div>
+          <div class="wifi-bar"></div>
+          <div class="wifi-bar"></div>
+          <div class="wifi-bar"></div>
+        </div>
+        <div class="conn-text-group">
+          <span class="conn-label-txt" id="connLabel">Offline</span>
+          <span class="conn-speed-txt" id="connSpeed">--</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- MODE TABS -->
+    <nav class="mode-tabs">
+      <button class="mode-tab active" data-mode="1">
+        <span class="tab-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <rect x="2" y="4" width="20" height="16" rx="3"/>
+            <line x1="8" y1="12" x2="16" y2="12"/>
+            <line x1="12" y1="8" x2="12" y2="16"/>
+          </svg>
+        </span>
+        D-PAD
+      </button>
+      <button class="mode-tab" data-mode="2">
+        <span class="tab-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <circle cx="12" cy="12" r="9"/>
+            <circle cx="12" cy="12" r="2"/>
+            <line x1="12" y1="5" x2="12" y2="10"/>
+            <line x1="6.3" y1="16.5" x2="10.3" y2="13.3"/>
+            <line x1="17.7" y1="16.5" x2="13.7" y2="13.3"/>
+          </svg>
+        </span>
+        STEERING
+      </button>
+      <button class="mode-tab" data-mode="3">
+        <span class="tab-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <rect x="5" y="2" width="14" height="20" rx="2"/>
+            <circle cx="12" cy="18" r="1"/>
+            <path d="M9 8l3-2 3 2"/>
+            <path d="M9 12l3 2 3-2"/>
+          </svg>
+        </span>
+        GYRO
+      </button>
+    </nav>
+
+    <!-- CONTROL AREA -->
+    <main class="control-area">
+
+      <!-- MODE 1: D-PAD -->
+      <section id="mode1" class="mode-panel active">
+        <div class="dpad-wrapper">
+          <div class="dpad-col">
+            <button class="ctrl-btn dpad-btn fwd-style" data-dir="forward">
+              <svg viewBox="0 0 24 24"><path d="M12 4l-8 10h5v6h6v-6h5z"/></svg>
+            </button>
+            <button class="ctrl-btn dpad-btn" data-dir="backward">
+              <svg viewBox="0 0 24 24"><path d="M12 20l8-10h-5V4H9v6H4z"/></svg>
+            </button>
+          </div>
+          <div class="dpad-center">
+            <div class="speedometer">
+              <div class="speedo-ring">
+                <span class="speedo-value" id="spd1">0</span>
+                <span class="speedo-unit">km/h</span>
+              </div>
+              <span class="speedo-label">Speed</span>
+            </div>
+            <button class="brake-btn dpad-brake" id="dpadBrake">
+              <svg viewBox="0 0 24 24">
+                <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/>
+                <rect x="10" y="7" width="4" height="10" rx="2" fill="currentColor"/>
+              </svg>
+              <span class="btn-lbl">Brake</span>
+            </button>
+          </div>
+          <div class="dpad-col">
+            <button class="ctrl-btn dpad-btn" data-dir="left">
+              <svg viewBox="0 0 24 24"><path d="M4 12l10-8v5h6v6h-6v5z"/></svg>
+            </button>
+            <button class="ctrl-btn dpad-btn" data-dir="right">
+              <svg viewBox="0 0 24 24"><path d="M20 12l-10-8v5H4v6h6v5z"/></svg>
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- MODE 2: STEERING WHEEL -->
+      <section id="mode2" class="mode-panel">
+        <div class="steering-layout">
+          <div class="steer-left">
+            <button class="ctrl-btn steer-fwd fwd-style" id="steerFwd">
+              <svg viewBox="0 0 24 24"><path d="M12 4l-8 10h5v6h6v-6h5z"/></svg>
+            </button>
+            <button class="ctrl-btn steer-bwd" id="steerBwd">
+              <svg viewBox="0 0 24 24"><path d="M12 20l8-10h-5V4H9v6H4z"/></svg>
+            </button>
+            <button class="brake-btn steer-brake" id="steerBrake">
+              <svg viewBox="0 0 24 24">
+                <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/>
+                <rect x="10" y="7" width="4" height="10" rx="2" fill="currentColor"/>
+              </svg>
+              <span class="btn-lbl">Brake</span>
+            </button>
+          </div>
+
+          <div class="steer-speedo-wrap">
+            <div class="speedometer">
+              <div class="speedo-ring">
+                <span class="speedo-value" id="spd2">0</span>
+                <span class="speedo-unit">km/h</span>
+              </div>
+              <span class="speedo-label">Speed</span>
+            </div>
+          </div>
+
+          <div class="wheel-wrapper">
+            <div class="wheel-angle-display" id="wheelAngleTxt">0&deg;</div>
+            <!-- Replace src with your steering.png -->
+            <img id="swImg" class="sw-img" src="steering.png" alt="Steering Wheel" draggable="false"/>
+          </div>
+        </div>
+      </section>
+
+      <!-- MODE 3: GYRO -->
+      <section id="mode3" class="mode-panel">
+        <div class="gyro-layout">
+          <div class="gyro-left">
+            <button class="brake-btn gyro-brake" id="gyroBrake">
+              <svg viewBox="0 0 24 24">
+                <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/>
+                <rect x="10" y="7" width="4" height="10" rx="2" fill="currentColor"/>
+              </svg>
+              <span class="btn-lbl">Brake</span>
+            </button>
+            <button class="ctrl-btn gyro-btn fwd-style" id="gyroFwd">
+              <svg viewBox="0 0 24 24"><path d="M12 4l-8 10h5v6h6v-6h5z"/></svg>
+              <span class="btn-lbl">FWD</span>
+            </button>
+          </div>
+          <div class="gyro-center">
+            <div class="speedometer">
+              <div class="speedo-ring">
+                <span class="speedo-value" id="spd3">0</span>
+                <span class="speedo-unit">km/h</span>
+              </div>
+              <span class="speedo-label">Speed</span>
+            </div>
+            <button class="btn-enable-gyro" id="btnEnableGyro">Enable Gyro</button>
+            <div class="gyro-sens">
+              <span class="sl">Sensitivity</span>
+              <input type="range" id="gyroSlider" min="10" max="100" value="50" step="5">
+              <span class="sv" id="gyroSensVal">50%</span>
+            </div>
+            <div class="gyro-readout">
+              <div><span class="rl">Fwd/Bwd </span><span id="gyroBeta">0</span>&deg;</div>
+              <div><span class="rl">L/R </span><span id="gyroGamma">0</span>&deg;</div>
+            </div>
+          </div>
+          <div class="gyro-right">
+            <button class="ctrl-btn gyro-btn" id="gyroBwd">
+              <svg viewBox="0 0 24 24"><path d="M12 20l8-10h-5V4H9v6H4z"/></svg>
+              <span class="btn-lbl">BWD</span>
+            </button>
+          </div>
+        </div>
+      </section>
+
+    </main>
+
+    <!-- BOTTOM TOGGLES -->
+    <div class="bottom-bar">
+      <!-- Beam: manual headlights (index 9). Mutually exclusive with Auto. -->
+      <button class="toggle-btn" id="btnBeam">
+        <svg viewBox="0 0 24 24">
+          <circle cx="12" cy="12" r="4" fill="currentColor"/>
+          <path d="M12 2v2M12 20v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M2 12h2M20 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none"/>
+        </svg>
+        <span>Beam</span>
+      </button>
+
+      <!-- Auto headlight (index 10). Mutually exclusive with Beam. -->
+      <button class="toggle-btn" id="btnAutoLight">
+        <svg viewBox="0 0 24 24">
+          <path d="M12 3C7 3 3 7 3 12s4 9 9 9 9-4 9-9" fill="none" stroke="currentColor" stroke-width="2"/>
+          <text x="12" y="15" text-anchor="middle" font-size="9" font-weight="bold" fill="currentColor" font-family="sans-serif">A</text>
+          <circle cx="18" cy="6" r="2" fill="currentColor" opacity="0.6"/>
+        </svg>
+        <span>Auto</span>
+      </button>
+
+      <!-- Wander (index 11). Auto-disables on any interaction. -->
+      <button class="toggle-btn" id="btnWander">
+        <svg viewBox="0 0 24 24">
+          <path d="M3 12c2-3 4-3 6 0s4 3 6 0 4-3 6 0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          <path d="M3 17c2-3 4-3 6 0s4 3 6 0 4-3 6 0" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" opacity="0.4"/>
+        </svg>
+        <span>Wander</span>
+      </button>
+
+      <!-- Avoid Obstacle (index 12) -->
+      <button class="toggle-btn" id="btnAvoid">
+        <svg viewBox="0 0 24 24">
+          <path d="M12 2L2 7l10 5 10-5z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M2 17l10 5 10-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M2 12l10 5 10-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <span>Avoid</span>
+      </button>
+    </div>
+
+    <!-- TX DISPLAY -->
+    <div class="debug-bar glass">
+      <span class="lbl">TX:</span>
+      <code id="txDisplay">+000+0000000</code>
+    </div>
+
+  </div>
+
+  <script>
+    'use strict';
+
+    /* ============================================================
+     * ORIENTATION LOCK
+     * ============================================================ */
+    async function tryLockLandscape() {
+      if (window.innerWidth >= 1024 && window.innerHeight >= 1024) return;
+      try {
+        if (document.documentElement.requestFullscreen)
+          await document.documentElement.requestFullscreen();
+        if (screen.orientation && screen.orientation.lock)
+          await screen.orientation.lock('landscape');
+      } catch(e) {}
+    }
+    tryLockLandscape();
+    document.addEventListener('click', tryLockLandscape, { once: true });
+
+    /* ============================================================
+     * STATE
+     * ============================================================ */
+    const S = {
+      mode: 1,
+      move:  { sign: '+', value: 0 },
+      steer: { sign: '+', value: 0 },
+      wheelAngle: 0,
+      brake: 0, beam: 0, autoLight: 0, wander: 0, avoid: 0,
+      speed: 0,
+      gyroEnabled: false, gyroSens: 50, gyroDir: null
+    };
+
+    /* ============================================================
+     * DOM
+     * ============================================================ */
+    const $  = s => document.querySelector(s);
+    const $$ = s => document.querySelectorAll(s);
+
+    const D = {
+      spd:      ['spd1','spd2','spd3'].map($),
+      connLbl:  $('#connLabel'),
+      connSpeed:$('#connSpeed'),
+      wifiBars: $('#wifiBars'),
+      txDisp:   $('#txDisplay'),
+      tabs:     $$('.mode-tab'), panels: $$('.mode-panel'),
+      dpadBtns: $$('.dpad-btn[data-dir]'), dpadBrk: $('#dpadBrake'),
+      sw: $('#swImg'), swTxt: $('#wheelAngleTxt'),
+      sFwd: $('#steerFwd'), sBwd: $('#steerBwd'), sBrk: $('#steerBrake'),
+      gBeta: $('#gyroBeta'), gGamma: $('#gyroGamma'),
+      gEnBtn: $('#btnEnableGyro'), gBrk: $('#gyroBrake'),
+      gFwd: $('#gyroFwd'), gBwd: $('#gyroBwd'),
+      gSlider: $('#gyroSlider'), gSensVal: $('#gyroSensVal'),
+      btnBeam: $('#btnBeam'), btnAuto: $('#btnAutoLight'),
+      btnWand: $('#btnWander'), btnAvoid: $('#btnAvoid'),
+    };
+
+    /* ============================================================
+     * WEBSOCKET
+     * RX format (10 chars): [0-2] speed 000-255, [3-9] other telemetry
+     * TX format (13 chars): see protocol above
+     * ============================================================ */
+    let ws = null;
+    let wsReconnectTimer = null;
+    let wsByteCount = 0;
+    let wsSpeedTimer = null;
+
+    /* Track bytes-per-second for connection speed display */
+    setInterval(() => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) { wsByteCount = 0; return; }
+      const bps = wsByteCount;
+      wsByteCount = 0;
+      if (D.connSpeed) {
+        if (bps < 1024) D.connSpeed.textContent = bps + ' B/s';
+        else D.connSpeed.textContent = (bps / 1024).toFixed(1) + ' KB/s';
+      }
+    }, 1000);
+
+    function setSignalBars(level) {
+      /* level: 0=offline, 1=weak, 2=fair, 3=good, 4=excellent */
+      if (!D.wifiBars) return;
+      D.wifiBars.className = 'wifi-bars' + (level > 0 ? ' sig-' + level : '');
+    }
+
+    function setConnected(isConn, rssi) {
+      /* rssi: dBm value from ESP32 (e.g. -45 strong, -80 weak), or null */
+      if (D.connLbl) {
+        D.connLbl.textContent = isConn ? 'Connected' : 'Offline';
+        D.connLbl.classList.toggle('connected', isConn);
+      }
+      if (!isConn) {
+        setSignalBars(0);
+        if (D.connSpeed) D.connSpeed.textContent = '--';
+        return;
+      }
+      /* Map RSSI to 1-4 bars */
+      if (rssi == null) { setSignalBars(4); return; }
+      if (rssi >= -55)      setSignalBars(4);
+      else if (rssi >= -65) setSignalBars(3);
+      else if (rssi >= -75) setSignalBars(2);
+      else                  setSignalBars(1);
+    }
+
+    function connectWebSocket() {
+      clearTimeout(wsReconnectTimer);
+      /* Change IP to your ESP32 hotspot address */
+      ws = new WebSocket('ws://192.168.4.1/ws');
+
+      ws.onopen = () => {
+        setConnected(true, null);
+        console.log('[RC PILOT] WebSocket connected');
+      };
+
+      ws.onclose = () => {
+        setConnected(false, null);
+        console.log('[RC PILOT] WebSocket closed, retrying in 3s...');
+        wsReconnectTimer = setTimeout(connectWebSocket, 3000);
+      };
+
+      ws.onerror = () => { ws.close(); };
+
+      ws.onmessage = (event) => {
+        const rx = typeof event.data === 'string' ? event.data : '';
+        wsByteCount += rx.length;
+
+        /* RX protocol: 10-char string
+         * [0-2]  car speed   000-255
+         * [3-5]  optional extra data (e.g. RSSI as signed int, pad with sign)
+         * [6-9]  reserved / future use
+         *
+         * Minimum requirement: first 3 chars = speed
+         */
+        if (rx.length >= 3) {
+          const carSpeed = parseInt(rx.substring(0, 3), 10);
+          if (!isNaN(carSpeed)) {
+            S.speed = Math.min(999, carSpeed);
+            updateSpeeds();
+          }
+        }
+        /* Optional: parse RSSI from chars [3-6] if your ESP32 sends it */
+        if (rx.length >= 7) {
+          const rssi = parseInt(rx.substring(3, 7), 10);
+          if (!isNaN(rssi) && rssi < 0) setConnected(true, rssi);
+          else setConnected(true, null);
+        }
+      };
+    }
+
+    /* Uncomment to activate WebSocket:
+    connectWebSocket();
+    */
+
+    /* ============================================================
+     * PROTOCOL ENCODER
+     * encodeSigned4(value) → 4-char signed string
+     *   Range:  -255 to +255
+     *   Format: sign (+ or -) + 3-digit zero-padded magnitude
+     *   Examples:
+     *     encodeSigned4(5)    → "+005"
+     *     encodeSigned4(-9)   → "-009"
+     *     encodeSigned4(120)  → "+120"
+     *     encodeSigned4(-255) → "-255"
+     *     encodeSigned4(0)    → "+000"
+     * ============================================================ */
+    function encodeSigned4(value) {
+      const clamped = Math.max(-255, Math.min(255, Math.round(value)));
+      const sign = clamped < 0 ? '-' : '+';
+      const mag  = String(Math.abs(clamped)).padStart(3, '0');
+      return sign + mag; /* always exactly 4 chars */
+    }
+
+    /* ============================================================
+     * PROTOCOL BUILDER — strict 13-char fixed-width packet
+     *
+     * S.move.sign  '+' | '-'   combined with S.move.value  0-255
+     * S.steer.sign '+' | '-'   combined with S.steer.value 0-255
+     *
+     * Packet layout:
+     *   [0-3]  FBSpeed      encodeSigned4  e.g. "+255", "-120", "+000"
+     *   [4-7]  Steering     encodeSigned4  e.g. "+255", "-255", "+000"
+     *   [8]    Stop flag    '0' = drive,   '1' = brake
+     *   [9]    Beam         '0' | '1'
+     *   [10]   AutoHdLight  '0' | '1'
+     *   [11]   Wander       '0' | '1'
+     *   [12]   AvoidObs     '0' | '1'
+     *
+     * Example valid packets:
+     *   "+255+000000000"  full forward, all flags off
+     *   "-255+000000000"  full reverse
+     *   "+120-200000100"  fwd + left steer + avoidObstacle
+     *   "+000+000100000"  brake engaged
+     * ============================================================ */
+    function buildTx() {
+      /* Convert sign+value pair into a signed integer for encodeSigned4 */
+      const moveSigned  = S.move.sign  === '-' ? -S.move.value  : S.move.value;
+      const steerSigned = S.steer.sign === '-' ? -S.steer.value : S.steer.value;
+
+      return (
+        encodeSigned4(moveSigned)  +   /* [0-3]  FBSpeed     */
+        encodeSigned4(steerSigned) +   /* [4-7]  Steering    */
+        S.brake     +                  /* [8]    Stop flag   */
+        S.beam      +                  /* [9]    Beam        */
+        S.autoLight +                  /* [10]   AutoHdLight */
+        S.wander    +                  /* [11]   Wander      */
+        S.avoid                        /* [12]   AvoidObs    */
+      );
+    }
+
+    let lastTx = '';
+    function send() {
+      const cmd = buildTx();
+      /* Sanity-check length before transmitting */
+      if (cmd.length !== 13) {
+        console.error('[RC PILOT] Malformed packet (len=' + cmd.length + '):', cmd);
+        return;
+      }
+      D.txDisp.textContent = cmd;
+      if (cmd === lastTx) return;
+      lastTx = cmd;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(cmd);
+      } else {
+        console.log('[RC PILOT] TX ->', cmd);
+      }
+    }
+    function updateSpeeds() { D.spd.forEach(el => { if(el) el.textContent = S.speed; }); }
+
+    /* ============================================================
+     * WANDER AUTO-DISABLE on any interaction except wander btn
+     * ============================================================ */
+    function disableWander() {
+      if (!S.wander) return;
+      S.wander = 0; updateUI(); send();
+    }
+    ['pointerdown','keydown','touchstart'].forEach(ev => {
+      document.addEventListener(ev, e => {
+        if (e.target && e.target.closest && e.target.closest('#btnWander')) return;
+        disableWander();
+      }, { capture: true, passive: true });
+    });
+
+    /* ============================================================
+     * MODE SWITCH
+     * ============================================================ */
+    function switchMode(n) {
+      S.mode = n;
+      D.tabs.forEach(t => t.classList.toggle('active', +t.dataset.mode === n));
+      D.panels.forEach((p,i) => p.classList.toggle('active', i+1 === n));
+      hardStopMove(); hardStopSteer(); relBrake();
+      if (n !== 3) S.gyroDir = null;
+    }
+    D.tabs.forEach(t => t.addEventListener('click', () => switchMode(+t.dataset.mode)));
+
+    /* ============================================================
+     * BRAKE
+     * ============================================================ */
+    function engBrake() {
+      S.brake = 1;
+      hardStopMove(); /* kills ramp-down too */
+      S.move.value = 0; S.move.sign = '+';
+      send();
+    }
+    function relBrake() { S.brake = 0; send(); }
+
+    /* ============================================================
+     * MOVEMENT — with conflict guard + gradual deceleration
+     *
+     * Rules:
+     *   - If opposite direction is currently active, ignore new press
+     *   - On release: ramp down over ~0.5s via RAF (not instant zero)
+     *   - hardStopMove(): instant zero (used by brake / mode switch)
+     * ============================================================ */
+    let moveRampUp   = null;   // setInterval for ramp-up
+    let moveRampDown = null;   // requestAnimationFrame id for ramp-down
+    let activeMovDir = null;   // 'forward' | 'backward' | null
+
+    function startMove(dir) {
+      /* Conflict guard: ignore if opposite is held */
+      if (activeMovDir !== null && activeMovDir !== dir) return;
+
+      /* Cancel any ramp-down in progress */
+      cancelAnimationFrame(moveRampDown); moveRampDown = null;
+
+      /* Already ramping up this direction — do nothing */
+      if (moveRampUp !== null && activeMovDir === dir) return;
+
+      clearInterval(moveRampUp); moveRampUp = null;
+      activeMovDir = dir;
+      S.move.sign = dir === 'forward' ? '+' : '-';
+      if (S.mode === 3) S.gyroDir = dir;
+
+      moveRampUp = setInterval(() => {
+        if (S.move.value < 255) { S.move.value = Math.min(255, S.move.value + 10); send(); }
+        else { clearInterval(moveRampUp); moveRampUp = null; }
+      }, 25);
+      S.move.value = Math.min(255, S.move.value + 10);
+      send();
+    }
+
+    function stopMove(dir) {
+      /* Only stop if this is the direction that's currently active */
+      if (dir && activeMovDir !== dir) return;
+
+      clearInterval(moveRampUp); moveRampUp = null;
+      activeMovDir = null;
+      if (S.mode === 3) S.gyroDir = null;
+
+      /* Ramp down over ~0.5s: decay factor per frame at 60fps ≈ 0.91^30 ~ 0.06 */
+      const DECAY = 0.88; /* per ~16ms frame → reaches ~5% in ~0.5s */
+      cancelAnimationFrame(moveRampDown);
+      (function rampDown() {
+        if (S.move.value <= 1) {
+          S.move.value = 0; S.move.sign = '+'; send(); return;
+        }
+        S.move.value = Math.floor(S.move.value * DECAY);
+        send();
+        moveRampDown = requestAnimationFrame(rampDown);
+      })();
+    }
+
+    function hardStopMove() {
+      clearInterval(moveRampUp); moveRampUp = null;
+      cancelAnimationFrame(moveRampDown); moveRampDown = null;
+      activeMovDir = null;
+      S.move.value = 0; S.move.sign = '+';
+      if (S.mode === 3) S.gyroDir = null;
+      send();
+    }
+
+    /* ============================================================
+     * STEERING — with conflict guard + glitch-free direction change
+     *
+     * Rules:
+     *   - If opposite direction is currently active, ignore new press
+     *   - Each direction tracked independently with held-set
+     *   - On release: smooth return-to-center via RAF
+     *   - Switching direction mid-way: old interval cleared THEN new one starts,
+     *     no RAF conflict because retCenter cancels itself before starting
+     * ============================================================ */
+    let steerIv      = null;  /* ramp-out interval */
+    let retCenterRAF = null;  /* return-to-center RAF */
+    let activeSteerDir = null; /* 'left' | 'right' | null */
+
+    function startSteer(dir) {
+      /* Conflict guard: ignore if opposite direction held */
+      if (activeSteerDir !== null && activeSteerDir !== dir) return;
+      if (activeSteerDir === dir) return; /* already running this way */
+
+      /* Cancel return-to-center */
+      cancelAnimationFrame(retCenterRAF); retCenterRAF = null;
+
+      /* Clear any previous interval */
+      clearInterval(steerIv); steerIv = null;
+
+      activeSteerDir = dir;
+
+      steerIv = setInterval(() => {
+        const step = dir === 'right' ? 5 : -5;
+        S.wheelAngle = Math.max(-360, Math.min(360, S.wheelAngle + step));
+        syncSteer(); send(); updateWheelUI();
+      }, 25);
+    }
+
+    function stopSteer(dir) {
+      /* Only stop if this is the active direction */
+      if (dir && activeSteerDir !== dir) return;
+
+      clearInterval(steerIv); steerIv = null;
+      activeSteerDir = null;
+      retCenter();
+    }
+
+    function hardStopSteer() {
+      clearInterval(steerIv); steerIv = null;
+      cancelAnimationFrame(retCenterRAF); retCenterRAF = null;
+      activeSteerDir = null;
+      S.wheelAngle = 0; syncSteer(); send(); updateWheelUI();
+    }
+
+    function syncSteer() {
+      S.steer.sign  = S.wheelAngle >= 0 ? '+' : '-';
+      S.steer.value = Math.round((Math.abs(S.wheelAngle) / 360) * 255);
+    }
+
+    function retCenter() {
+      cancelAnimationFrame(retCenterRAF); retCenterRAF = null;
+      /* Don't fight an active steer interval */
+      if (activeSteerDir !== null) return;
+      (function step() {
+        if (Math.abs(S.wheelAngle) < 0.5) {
+          S.wheelAngle = 0; syncSteer(); send(); updateWheelUI(); return;
+        }
+        S.wheelAngle *= 0.88; syncSteer(); send(); updateWheelUI();
+        retCenterRAF = requestAnimationFrame(step);
+      })();
+    }
+
+    function updateWheelUI() {
+      if (D.sw)    D.sw.style.transform = `rotate(${S.wheelAngle}deg)`;
+      if (D.swTxt) D.swTxt.textContent  = `${Math.round(S.wheelAngle)}\u00B0`;
+    }
+
+    /* ============================================================
+     * BUTTON GLOW HELPERS — highlight ALL buttons for a direction
+     * Works across D-Pad, Steering mode, and Gyro mode buttons
+     * ============================================================ */
+    const dirBtnMap = {
+      forward:  ['.dpad-btn[data-dir="forward"]', '#steerFwd', '#gyroFwd'],
+      backward: ['.dpad-btn[data-dir="backward"]', '#steerBwd', '#gyroBwd'],
+      left:     ['.dpad-btn[data-dir="left"]'],
+      right:    ['.dpad-btn[data-dir="right"]'],
+    };
+    function setDirGlow(dir, on) {
+      (dirBtnMap[dir] || []).forEach(sel => {
+        const el = $(sel);
+        if (el) el.classList.toggle('pressed', on);
+      });
+    }
+
+    /* ============================================================
+     * D-PAD BUTTON EVENTS
+     * ============================================================ */
+    D.dpadBtns.forEach(btn => {
+      const dir    = btn.dataset.dir;
+      const isMove = dir === 'forward' || dir === 'backward';
+      btn.addEventListener('pointerdown', e => {
+        e.preventDefault();
+        setDirGlow(dir, true);
+        isMove ? startMove(dir) : startSteer(dir);
+      });
+      const up = e => {
+        e.preventDefault();
+        setDirGlow(dir, false);
+        isMove ? stopMove(dir) : stopSteer(dir);
+      };
+      btn.addEventListener('pointerup', up);
+      btn.addEventListener('pointerleave', up);
+      btn.addEventListener('pointercancel', up);
+    });
+
+    /* D-Pad Brake */
+    (() => {
+      const b = D.dpadBrk;
+      b.addEventListener('pointerdown', e => { e.preventDefault(); b.classList.add('pressed'); engBrake(); });
+      const up = e => { e.preventDefault(); b.classList.remove('pressed'); relBrake(); };
+      b.addEventListener('pointerup', up); b.addEventListener('pointerleave', up); b.addEventListener('pointercancel', up);
+    })();
+
+    /* ============================================================
+     * KEYBOARD — keys glow buttons, respect conflict guards
+     * ============================================================ */
+    const held = new Set();
+
+    document.addEventListener('keydown', e => {
+      if (held.has(e.key)) return;
+      held.add(e.key);
+      switch(e.key) {
+        case 'ArrowUp':    case 'w': case 'W':
+          e.preventDefault();
+          setDirGlow('forward', true);
+          startMove('forward');
+          break;
+        case 'ArrowDown':  case 's': case 'S':
+          e.preventDefault();
+          setDirGlow('backward', true);
+          startMove('backward');
+          break;
+        case 'ArrowLeft':  case 'a': case 'A':
+          e.preventDefault();
+          setDirGlow('left', true);
+          startSteer('left');
+          break;
+        case 'ArrowRight': case 'd': case 'D':
+          e.preventDefault();
+          setDirGlow('right', true);
+          startSteer('right');
+          break;
+        case ' ':
+          e.preventDefault();
+          D.dpadBrk.classList.add('pressed');
+          engBrake();
+          break;
+        case 'b': case 'B': tBeam();  break;
+        case 'l': case 'L': tAuto();  break;
+        case 'm': case 'M': tWand();  break;
+        case 'v': case 'V': tAvoid(); break;
+      }
+    });
+
+    document.addEventListener('keyup', e => {
+      held.delete(e.key);
+      switch(e.key) {
+        case 'ArrowUp':    case 'w': case 'W':
+          setDirGlow('forward', false);
+          stopMove('forward');
+          break;
+        case 'ArrowDown':  case 's': case 'S':
+          setDirGlow('backward', false);
+          stopMove('backward');
+          break;
+        case 'ArrowLeft':  case 'a': case 'A':
+          setDirGlow('left', false);
+          stopSteer('left');
+          break;
+        case 'ArrowRight': case 'd': case 'D':
+          setDirGlow('right', false);
+          stopSteer('right');
+          break;
+        case ' ':
+          D.dpadBrk.classList.remove('pressed');
+          relBrake();
+          break;
+      }
+    });
+
+    /* ============================================================
+     * STEERING WHEEL DRAG (image)
+     * ============================================================ */
+    let dragging = false, lastDragAng = 0;
+
+    D.sw.addEventListener('pointerdown', e => {
+      e.preventDefault();
+      /* Stop any keyboard/button steering before drag takes over */
+      clearInterval(steerIv); steerIv = null;
+      activeSteerDir = null;
+      cancelAnimationFrame(retCenterRAF); retCenterRAF = null;
+
+      dragging = true;
+      D.sw.classList.add('dragging');
+      D.sw.setPointerCapture(e.pointerId);
+      const r = D.sw.getBoundingClientRect();
+      lastDragAng = Math.atan2(e.clientY-(r.top+r.height/2), e.clientX-(r.left+r.width/2)) * (180/Math.PI);
+    });
+
+    document.addEventListener('pointermove', e => {
+      if (!dragging) return;
+      const r = D.sw.getBoundingClientRect();
+      const cur = Math.atan2(e.clientY-(r.top+r.height/2), e.clientX-(r.left+r.width/2)) * (180/Math.PI);
+      let d = cur - lastDragAng;
+      if (d > 180) d -= 360; if (d < -180) d += 360;
+      S.wheelAngle = Math.max(-360, Math.min(360, S.wheelAngle + d));
+      lastDragAng = cur;
+      syncSteer(); send(); updateWheelUI();
+    });
+
+    document.addEventListener('pointerup', e => {
+      if (!dragging) return;
+      dragging = false;
+      D.sw.classList.remove('dragging');
+      retCenter();
+    });
+
+    /* ============================================================
+     * STEERING MODE BUTTONS (holdBtn helper)
+     * ============================================================ */
+    function holdBtn(el, dn, up) {
+      el.addEventListener('pointerdown', e => { e.preventDefault(); el.classList.add('pressed'); dn(); });
+      const u = e => { e.preventDefault(); el.classList.remove('pressed'); up(); };
+      el.addEventListener('pointerup', u); el.addEventListener('pointerleave', u); el.addEventListener('pointercancel', u);
+    }
+    holdBtn(D.sFwd, () => startMove('forward'),  () => stopMove('forward'));
+    holdBtn(D.sBwd, () => startMove('backward'), () => stopMove('backward'));
+    holdBtn(D.sBrk, engBrake, relBrake);
+
+    /* ============================================================
+     * GYRO MODE
+     * beta (front/back tilt) → movement magnitude & direction
+     * gamma (left/right) → display only
+     * ============================================================ */
+    function handleOrientation(evt) {
+      if (S.mode !== 3 || !S.gyroEnabled) return;
+      const beta  = evt.beta  || 0;
+      const gamma = evt.gamma || 0;
+      D.gBeta.textContent  = Math.round(beta);
+      D.gGamma.textContent = Math.round(gamma);
+
+      const maxTilt = Math.max(5, 55 - (S.gyroSens - 10) * 0.5);
+      const clamped = Math.max(-maxTilt, Math.min(maxTilt, beta));
+      const mag     = Math.round((Math.abs(clamped) / maxTilt) * 255);
+
+      /* Stop ramp intervals — gyro sets value directly */
+      clearInterval(moveRampUp); moveRampUp = null;
+      cancelAnimationFrame(moveRampDown); moveRampDown = null;
+
+      if (mag < 8) {
+        S.move.value = 0; S.move.sign = '+';
+      } else {
+        S.move.sign  = S.gyroDir ? (S.gyroDir === 'forward' ? '+' : '-') : (clamped >= 0 ? '+' : '-');
+        S.move.value = mag;
+      }
+      send();
+    }
+
+    D.gEnBtn.addEventListener('click', async () => {
+      if (S.gyroEnabled) {
+        S.gyroEnabled = false;
+        window.removeEventListener('deviceorientation', handleOrientation);
+        D.gEnBtn.textContent = 'Enable Gyro'; D.gEnBtn.classList.remove('enabled');
+        hardStopMove(); D.gBeta.textContent = '0'; D.gGamma.textContent = '0'; return;
+      }
+      if (typeof DeviceOrientationEvent !== 'undefined' &&
+          typeof DeviceOrientationEvent.requestPermission === 'function') {
+        try {
+          const p = await DeviceOrientationEvent.requestPermission();
+          if (p !== 'granted') { alert('Gyroscope permission denied.'); return; }
+        } catch(e) { alert('Could not request gyro permission.'); return; }
+      }
+      if (typeof DeviceOrientationEvent === 'undefined') { alert('Gyroscope not supported.'); return; }
+      S.gyroEnabled = true;
+      window.addEventListener('deviceorientation', handleOrientation);
+      D.gEnBtn.textContent = 'Gyro Active'; D.gEnBtn.classList.add('enabled');
+    });
+
+    holdBtn(D.gFwd,
+      () => { S.gyroDir = 'forward';  if (!S.gyroEnabled) startMove('forward'); },
+      () => { S.gyroDir = null;       if (!S.gyroEnabled) stopMove('forward'); }
+    );
+    holdBtn(D.gBwd,
+      () => { S.gyroDir = 'backward'; if (!S.gyroEnabled) startMove('backward'); },
+      () => { S.gyroDir = null;       if (!S.gyroEnabled) stopMove('backward'); }
+    );
+    holdBtn(D.gBrk, engBrake, relBrake);
+
+    D.gSlider.addEventListener('input', e => {
+      S.gyroSens = +e.target.value;
+      D.gSensVal.textContent = S.gyroSens + '%';
+    });
+
+    /* ============================================================
+     * TOGGLE BUTTONS (beam & auto mutually exclusive)
+     * ============================================================ */
+    function updateUI() {
+      D.btnBeam.classList.toggle('beam-on',   !!S.beam);
+      D.btnAuto.classList.toggle('auto-on',   !!S.autoLight);
+      D.btnWand.classList.toggle('wander-on', !!S.wander);
+      D.btnAvoid.classList.toggle('avoid-on', !!S.avoid);
+    }
+    function tBeam()  { S.beam      = S.beam      ? 0 : 1; if(S.beam)      S.autoLight = 0; updateUI(); send(); }
+    function tAuto()  { S.autoLight = S.autoLight ? 0 : 1; if(S.autoLight) S.beam      = 0; updateUI(); send(); }
+    function tWand()  { S.wander    = S.wander    ? 0 : 1; updateUI(); send(); }
+    function tAvoid() { S.avoid     = S.avoid     ? 0 : 1; updateUI(); send(); }
+    D.btnBeam.addEventListener('click', tBeam);
+    D.btnAuto.addEventListener('click', tAuto);
+    D.btnWand.addEventListener('click', tWand);
+    D.btnAvoid.addEventListener('click', tAvoid);
+
+    /* ============================================================
+     * PREVENT NATIVE MOBILE GESTURES
+     * ============================================================ */
+    document.addEventListener('touchmove',     e => e.preventDefault(), { passive: false });
+    document.addEventListener('gesturestart',  e => e.preventDefault());
+    document.addEventListener('gesturechange', e => e.preventDefault());
+
+    /* ============================================================
+     * FULLSCREEN
+     * Request fullscreen on mobile on first user interaction
+     * ============================================================ */
+    function requestFullscreen() {
+      const el = document.documentElement;
+      if (el.requestFullscreen)            el.requestFullscreen();
+      else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+      else if (el.mozRequestFullScreen)    el.mozRequestFullScreen();
+      else if (el.msRequestFullscreen)     el.msRequestFullscreen();
+    }
+
+    /* On mobile, go fullscreen on first tap (needs user gesture) */
+    let fullscreenDone = false;
+    document.addEventListener('pointerdown', () => {
+      if (fullscreenDone) return;
+      fullscreenDone = true;
+      requestFullscreen();
+    }, { once: true });
+
+    /* ============================================================
+     * INIT
+     * ============================================================ */
+    send();
+    updateSpeeds();
+    updateUI();
+    setConnected(false, null); /* show offline state */
+
+    /* Activate WebSocket — change IP to match your ESP32 */
+    connectWebSocket();
+
+    console.log('[RC PILOT] Ready — TX: [0]±mov[1-3] [4]±steer[5-7] [8]brk [9]beam [10]auto [11]wand [12]avoid');
+    console.log('[RC PILOT] RX: 10 chars — [0-2]=speed(000-255) [3-6]=RSSI(optional) [7-9]=reserved');
+    console.log('[RC PILOT] Keys: WASD/Arrows=drive, Space=brake, B=beam, L=auto, M=wander, V=avoid');
+  </script>
+</body>
+</html>
