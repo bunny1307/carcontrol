@@ -89,7 +89,7 @@
 
     function connectWebSocket() {
       clearTimeout(wsReconnectTimer);
-      ws = new WebSocket('https://ira-timothy-any-citizenship.trycloudflare.com');
+      ws = new WebSocket('ws://192.168.4.1/ws');
 
       ws.onopen  = () => { setConnected(true, null); console.log('[RC PILOT] WS connected'); };
       ws.onclose = () => { setConnected(false, null); wsReconnectTimer = setTimeout(connectWebSocket, 3000); };
